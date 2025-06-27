@@ -2584,6 +2584,28 @@ typedef struct MaterialState {
     bool eof_underlying; /* reached end of underlying plan? */
     bool materalAll;
     Tuplestorestate* tuplestorestate;
+    
+    /* Parallel execution support */
+    bool enable_parallel;               /* Enable parallel materialization */
+    int num_parallel_workers;           /* Number of parallel workers */
+    struct SharedMaterialState* shared_state; /* Shared memory state */
+    struct ParallelWorkerInfo* worker_info;   /* This worker's info */
+    struct PartitionParallelState* partition_state; /* Partition-wise state */
+    
+    /* Lock-free buffer for parallel tuple access */
+    struct ParallelTupleBuffer* parallel_buffer;
+    
+    /* Worker synchronization */
+    bool is_parallel_leader;            /* True if this is the leader worker */
+    int worker_id;                      /* This worker's unique ID */
+    
+    /* Performance optimization flags */
+    bool use_lock_free_buffer;          /* Use lock-free circular buffer */
+    bool enable_partition_parallel;     /* Enable partition-wise parallelism */
+    
+    /* Memory allocation per worker */
+    int64 worker_memory_kb;             /* Memory allocated to this worker */
+    MemoryContext parallel_context;     /* Parallel-specific memory context */
 } MaterialState;
 
 /* ----------------

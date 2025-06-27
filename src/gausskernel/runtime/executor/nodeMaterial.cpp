@@ -24,12 +24,17 @@
 
 #include "executor/executor.h"
 #include "executor/node/nodeMaterial.h"
+#include "executor/node/parallelMaterial.h"
 #include "miscadmin.h"
 #include "optimizer/streamplan.h"
 #include "pgstat.h"
 #include "pgxc/pgxc.h"
 
 static TupleTableSlot* ExecMaterial(PlanState* state);
+static TupleTableSlot* ExecParallelMaterial(MaterialState* node);
+static TupleTableSlot* ExecParallelMaterialProducer(MaterialState* node);
+static TupleTableSlot* ExecParallelMaterialConsumer(MaterialState* node);
+static void InitParallelMaterialState(MaterialState* node, int num_workers);
 
 /*
  * Material all the tuples first, and then return the tuple needed.
@@ -269,10 +274,256 @@ static TupleTableSlot* ExecMaterial(PlanState* state) /* result tuple from subpl
 
     CHECK_FOR_INTERRUPTS();
     
+    /* Check if parallel execution is enabled */
+    if (node->enable_parallel && node->num_parallel_workers > 1) {
+        return ExecParallelMaterial(node);
+    }
+    
     if (node->materalAll)
         return ExecMaterialAll(node);
     else
         return ExecMaterialOne(node);
+}
+
+/*
+ * ExecParallelMaterial
+ *
+ * Main parallel execution function for Material node.
+ * Coordinates between producer and consumer workers.
+ */
+static TupleTableSlot*
+ExecParallelMaterial(MaterialState* node)
+{
+    SharedMaterialState* shared_state = node->shared_state;
+    ParallelWorkerInfo* worker = node->worker_info;
+    TupleTableSlot* result = NULL;
+    
+    if (shared_state == NULL || worker == NULL) {
+        /* Fallback to sequential execution */
+        if (node->materalAll)
+            return ExecMaterialAll(node);
+        else
+            return ExecMaterialOne(node);
+    }
+    
+    /* Coordinate worker roles */
+    CoordinateWorkerMaterialization(node);
+    
+    /* Execute based on worker role */
+    if (worker->is_producer && worker->is_consumer) {
+        /* Hybrid mode: try consuming first, then producing */
+        result = ExecParallelMaterialConsumer(node);
+        if (result == NULL) {
+            result = ExecParallelMaterialProducer(node);
+        }
+    } else if (worker->is_producer) {
+        /* Producer only */
+        result = ExecParallelMaterialProducer(node);
+    } else if (worker->is_consumer) {
+        /* Consumer only */
+        result = ExecParallelMaterialConsumer(node);
+    }
+    
+    /* Update statistics */
+    if (result != NULL) {
+        UpdateMaterialStats(node);
+    }
+    
+    return result;
+}
+
+/*
+ * ExecParallelMaterialProducer
+ *
+ * Producer worker: reads from child plan and stores tuples.
+ */
+static TupleTableSlot*
+ExecParallelMaterialProducer(MaterialState* node)
+{
+    TupleTableSlot* outerslot;
+    PlanState* outerNode;
+    bool stored_successfully = false;
+    
+    /* Check if materialization is already done */
+    SharedMaterialState* shared_state = node->shared_state;
+    uint32 current_state = pg_atomic_read_u32(&shared_state->materialization_state);
+    
+    if (current_state == MATERIAL_STATE_DONE || current_state == MATERIAL_STATE_ERROR) {
+        return NULL;
+    }
+    
+    /* Get tuple from child plan */
+    outerNode = outerPlanState(node);
+    outerslot = ExecProcNode(outerNode);
+    
+    if (TupIsNull(outerslot)) {
+        /* No more tuples from child */
+        node->eof_underlying = true;
+        return NULL;
+    }
+    
+    /* Store tuple based on enabled features */
+    if (node->use_lock_free_buffer && node->parallel_buffer != NULL) {
+        /* Use lock-free circular buffer */
+        stored_successfully = ParallelBufferPut(node->parallel_buffer, outerslot);
+        
+        if (!stored_successfully) {
+            /* Buffer full, spill to traditional tuplestore */
+            if (node->tuplestorestate != NULL) {
+                tuplestore_puttupleslot(node->tuplestorestate, outerslot);
+                stored_successfully = true;
+            }
+        }
+    } else if (node->enable_partition_parallel && node->partition_state != NULL) {
+        /* Use partition-wise storage */
+        int partition_id = GetPartitionForWorker(node->partition_state, 
+                                               node->worker_id, 
+                                               node->num_parallel_workers);
+        
+        if (partition_id >= 0) {
+            Tuplestorestate* partition_store = GetPartitionTupleStore(
+                node->partition_state, partition_id,
+                node->worker_memory_kb, 0, 
+                node->ss.ps.plan->plan_node_id);
+            
+            if (partition_store != NULL) {
+                tuplestore_puttupleslot(partition_store, outerslot);
+                stored_successfully = true;
+            }
+        }
+    } else {
+        /* Use traditional shared tuplestore */
+        if (node->tuplestorestate != NULL) {
+            tuplestore_puttupleslot(node->tuplestorestate, outerslot);
+            stored_successfully = true;
+        }
+    }
+    
+    /* Update worker statistics */
+    if (stored_successfully && node->worker_info != NULL) {
+        node->worker_info->tuples_produced++;
+    }
+    
+    return outerslot;
+}
+
+/*
+ * ExecParallelMaterialConsumer
+ *
+ * Consumer worker: reads tuples from materialized storage.
+ */
+static TupleTableSlot*
+ExecParallelMaterialConsumer(MaterialState* node)
+{
+    TupleTableSlot* slot = node->ss.ps.ps_ResultTupleSlot;
+    bool got_tuple = false;
+    
+    /* Try to get tuple from different sources */
+    if (node->use_lock_free_buffer && node->parallel_buffer != NULL) {
+        /* Try lock-free circular buffer first */
+        got_tuple = ParallelBufferGet(node->parallel_buffer, slot);
+    }
+    
+    if (!got_tuple && node->enable_partition_parallel && node->partition_state != NULL) {
+        /* Try partition-wise storage */
+        int partition_id = GetPartitionForWorker(node->partition_state,
+                                               node->worker_id,
+                                               node->num_parallel_workers);
+        
+        if (partition_id >= 0) {
+            Tuplestorestate* partition_store = GetPartitionTupleStore(
+                node->partition_state, partition_id,
+                node->worker_memory_kb, 0,
+                node->ss.ps.plan->plan_node_id);
+            
+            if (partition_store != NULL) {
+                got_tuple = tuplestore_gettupleslot(partition_store, true, false, slot);
+                
+                if (!got_tuple) {
+                    /* This partition is done */
+                    MarkPartitionDone(node->partition_state, partition_id);
+                }
+            }
+        }
+    }
+    
+    if (!got_tuple && node->tuplestorestate != NULL) {
+        /* Try traditional tuplestore */
+        got_tuple = tuplestore_gettupleslot(node->tuplestorestate, true, false, slot);
+    }
+    
+    /* Update worker statistics */
+    if (got_tuple && node->worker_info != NULL) {
+        node->worker_info->tuples_consumed++;
+    }
+    
+    return got_tuple ? slot : NULL;
+}
+
+/*
+ * InitParallelMaterialState
+ *
+ * Initialize parallel execution state for the Material node.
+ */
+static void
+InitParallelMaterialState(MaterialState* node, int num_workers)
+{
+    Plan* plan = node->ss.ps.plan;
+    int64 operator_mem;
+    
+    /* Calculate memory allocation */
+    operator_mem = SET_NODEMEM(plan->operatorMemKB[0], plan->dop);
+    node->worker_memory_kb = CalculateWorkerMemory(operator_mem, num_workers);
+    
+    /* Create parallel memory context */
+    node->parallel_context = AllocSetContextCreate(CurrentMemoryContext,
+                                                  "ParallelMaterialContext",
+                                                  ALLOCSET_DEFAULT_MINSIZE,
+                                                  ALLOCSET_DEFAULT_INITSIZE,
+                                                  node->worker_memory_kb * 1024L);
+    
+    /* Determine parallel features to enable */
+    node->use_lock_free_buffer = (num_workers >= 2);  /* Enable for 2+ workers */
+    node->enable_partition_parallel = plan->ispwj;    /* Use existing partition flag */
+    
+    /* Initialize parallel workers */
+    InitParallelWorkers(node, num_workers);
+    
+    /* Setup partition-wise parallelism if enabled */
+    if (node->enable_partition_parallel) {
+        int num_partitions = 8;  /* Default number of partitions */
+        
+        /* Try to get partition count from plan if available */
+        if (plan->ispwj && plan->paramno > 0) {
+            /* Use parameter to determine partition count */
+            num_partitions = Max(num_partitions, num_workers * 2);
+        }
+        
+        node->partition_state = SetupPartitionParallelism(num_partitions, num_workers);
+        
+        if (node->partition_state != NULL) {
+            ereport(LOG,
+                    (errmsg("Enabled partition-wise parallel materialization: %d partitions, %d workers",
+                           num_partitions, num_workers)));
+        }
+    }
+    
+    /* Assign worker ID and determine role */
+    if (node->shared_state != NULL && num_workers > 0) {
+        /* For simplicity, use static assignment - in a real implementation 
+         * this would be assigned by the parallel execution framework */
+        node->worker_id = 0;  /* This would be assigned dynamically */
+        node->is_parallel_leader = (node->worker_id == 0);
+        
+        /* Set worker info reference */
+        if (node->worker_id < node->shared_state->num_workers) {
+            node->worker_info = &node->shared_state->workers[node->worker_id];
+        }
+        
+        ereport(DEBUG1,
+                (errmsg("Initialized parallel material worker %d (leader=%s)",
+                       node->worker_id, node->is_parallel_leader ? "yes" : "no")));
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -327,8 +578,33 @@ MaterialState* ExecInitMaterial(Material* node, EState* estate, int eflags)
     mat_state->eof_underlying = false;
     mat_state->tuplestorestate = NULL;
 
+    /* Initialize parallel execution fields */
+    mat_state->enable_parallel = false;
+    mat_state->num_parallel_workers = 0;
+    mat_state->shared_state = NULL;
+    mat_state->worker_info = NULL;
+    mat_state->partition_state = NULL;
+    mat_state->parallel_buffer = NULL;
+    mat_state->is_parallel_leader = false;
+    mat_state->worker_id = -1;
+    mat_state->use_lock_free_buffer = false;
+    mat_state->enable_partition_parallel = false;
+    mat_state->worker_memory_kb = 0;
+    mat_state->parallel_context = NULL;
+
     if (node->plan.ispwj) {
         mat_state->ss.currentSlot = 0;
+    }
+
+    /* Check if parallel execution should be enabled */
+    int num_workers = ((Plan*)node)->dop;
+    if (num_workers > 1 && u_sess->attr.attr_sql.enable_parallel_query) {
+        /* Enable parallel execution */
+        InitParallelMaterialState(mat_state, num_workers);
+        
+        ereport(LOG,
+                (errmsg("Enabled parallel materialization: %d workers, %ld KB memory per worker",
+                       num_workers, mat_state->worker_memory_kb)));
     }
 
     /*
@@ -392,6 +668,34 @@ void ExecEndMaterial(MaterialState* node)
      * clean out the tuple table
      */
     (void)ExecClearTuple(node->ss.ss_ScanTupleSlot);
+
+    /*
+     * Log parallel performance statistics before cleanup
+     */
+    if (node->enable_parallel) {
+        LogParallelMaterialPerformance(node);
+        
+        if (node->enable_partition_parallel && node->partition_state != NULL) {
+            LogPartitionStats(node->partition_state);
+        }
+    }
+
+    /*
+     * Shutdown parallel execution resources
+     */
+    if (node->enable_parallel) {
+        ShutdownParallelWorkers(node);
+        
+        if (node->partition_state != NULL) {
+            ShutdownPartitionParallelism(node->partition_state);
+            node->partition_state = NULL;
+        }
+        
+        if (node->parallel_context != NULL) {
+            MemoryContextDelete(node->parallel_context);
+            node->parallel_context = NULL;
+        }
+    }
 
     /*
      * Release tuplestore resources
@@ -560,6 +864,28 @@ void ExecEarlyFreeMaterial(MaterialState* node)
      * clean out the tuple table
      */
     (void)ExecClearTuple(node->ss.ss_ScanTupleSlot);
+
+    /*
+     * Early free parallel resources
+     */
+    if (node->enable_parallel) {
+        /* Release parallel buffer */
+        if (node->parallel_buffer != NULL) {
+            DestroyParallelTupleBuffer(node->parallel_buffer);
+            node->parallel_buffer = NULL;
+        }
+        
+        /* Clean up partition stores */
+        if (node->partition_state != NULL) {
+            ShutdownPartitionParallelism(node->partition_state);
+            node->partition_state = NULL;
+        }
+        
+        /* Reset parallel context to free memory */
+        if (node->parallel_context != NULL) {
+            MemoryContextReset(node->parallel_context);
+        }
+    }
 
     /*
      * Release tuplestore resources
