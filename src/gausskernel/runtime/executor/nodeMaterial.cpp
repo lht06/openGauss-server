@@ -598,7 +598,7 @@ MaterialState* ExecInitMaterial(Material* node, EState* estate, int eflags)
 
     /* Check if parallel execution should be enabled */
     int num_workers = ((Plan*)node)->dop;
-    if (num_workers > 1 && u_sess->attr.attr_sql.enable_parallel_query) {
+    if (num_workers > 1) {
         /* Enable parallel execution */
         InitParallelMaterialState(mat_state, num_workers);
         

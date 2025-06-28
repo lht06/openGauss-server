@@ -16,10 +16,9 @@
 #define PARALLEL_MATERIAL_H
 
 #include "postgres.h"
-#include "storage/lwlock.h"
-#include "storage/condition_variable.h"
-#include "storage/spin.h"
-#include "utils/atomic.h"
+#include "storage/lock/lwlock.h"
+#include "storage/latch.h"
+#include "port/atomics.h"
 
 /* Forward declarations */
 struct MaterialState;
@@ -62,7 +61,7 @@ typedef struct ParallelWorkerInfo {
     
     /* Synchronization primitives */
     LWLock* coordination_lock;          /* Lock for worker coordination */
-    ConditionVariable* materialized_cv; /* CV for materialization completion */
+    Latch* materialized_latch;          /* Latch for materialization completion */
     
     /* Worker state */
     bool is_producer;                   /* True if this worker produces tuples */
@@ -84,7 +83,7 @@ typedef struct SharedMaterialState {
     
     /* Global synchronization */
     LWLock* global_lock;
-    ConditionVariable* all_done_cv;
+    Latch* all_done_latch;
     
     /* Global state flags */
     pg_atomic_uint32 materialization_state; /* 0=starting, 1=running, 2=done */

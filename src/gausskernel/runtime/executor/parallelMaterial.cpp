@@ -28,9 +28,9 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/hsearch.h"
-#include "storage/lwlock.h"
-#include "storage/condition_variable.h"
-#include "utils/atomic.h"
+#include "storage/lock/lwlock.h"
+#include "storage/latch.h"
+#include "port/atomics.h"
 #include "pgstat.h"
 
 /* Internal constants */
@@ -465,7 +465,8 @@ InitParallelWorkers(MaterialState* node, int num_workers)
     
     /* Initialize global synchronization */
     shared_state->global_lock = LWLockAssign();
-    ConditionVariableInit(&shared_state->all_done_cv);
+    shared_state->all_done_latch = (Latch*) palloc0(sizeof(Latch));
+    InitLatch(shared_state->all_done_latch);
     
     /* Initialize atomic variables */
     pg_atomic_init_u32(&shared_state->materialization_state, MATERIAL_STATE_STARTING);
@@ -487,7 +488,8 @@ InitParallelWorkers(MaterialState* node, int num_workers)
         
         /* Setup synchronization */
         worker->coordination_lock = LWLockAssign();
-        ConditionVariableInit(&worker->materialized_cv);
+        worker->materialized_latch = (Latch*) palloc0(sizeof(Latch));
+        InitLatch(worker->materialized_latch);
         
         /* Initialize worker state */
         worker->is_producer = true;   /* All workers can produce initially */
@@ -552,11 +554,11 @@ ShutdownParallelWorkers(MaterialState* node)
     LWLockRelease(shared_state->global_lock);
     
     /* Wake up all waiting workers */
-    ConditionVariableBroadcast(&shared_state->all_done_cv);
+    SetLatch(shared_state->all_done_latch);
     
     for (i = 0; i < shared_state->num_workers; i++) {
         ParallelWorkerInfo* worker = &shared_state->workers[i];
-        ConditionVariableBroadcast(&worker->materialized_cv);
+        SetLatch(worker->materialized_latch);
     }
     
     /* Wait for all workers to finish */
@@ -690,7 +692,7 @@ CoordinateWorkerMaterialization(MaterialState* node)
     LWLockRelease(worker->coordination_lock);
     
     /* Signal role changes to other workers */
-    ConditionVariableSignal(&worker->materialized_cv);
+    SetLatch(worker->materialized_latch);
     
     ereport(DEBUG3,
             (errmsg("Worker %d coordination: produce=%s, consume=%s, state=%u",
