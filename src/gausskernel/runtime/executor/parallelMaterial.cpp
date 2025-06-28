@@ -464,7 +464,7 @@ InitParallelWorkers(MaterialState* node, int num_workers)
     shared_state->num_workers = num_workers;
     
     /* Initialize global synchronization */
-    shared_state->global_lock = LWLockAssign();
+    shared_state->global_lock = LWLockAssign(LWTRANCHE_PARALLEL_HASH_JOIN);
     shared_state->all_done_latch = (Latch*) palloc0(sizeof(Latch));
     InitLatch(shared_state->all_done_latch);
     
@@ -487,7 +487,7 @@ InitParallelWorkers(MaterialState* node, int num_workers)
         worker->worker_mem_kb = CalculateWorkerMemory(node->worker_memory_kb, num_workers);
         
         /* Setup synchronization */
-        worker->coordination_lock = LWLockAssign();
+        worker->coordination_lock = LWLockAssign(LWTRANCHE_PARALLEL_HASH_JOIN);
         worker->materialized_latch = (Latch*) palloc0(sizeof(Latch));
         InitLatch(worker->materialized_latch);
         
@@ -653,11 +653,12 @@ CoordinateWorkerMaterialization(MaterialState* node)
             break;
             
         case MATERIAL_STATE_RUNNING:
-            /* Normal operation - coordinate work distribution */
-            
-            /* Dynamic load balancing based on worker performance */
-            uint64 avg_produced = pg_atomic_read_u32(&shared_state->total_tuples) / 
-                                 shared_state->num_workers;
+            {
+                /* Normal operation - coordinate work distribution */
+                
+                /* Dynamic load balancing based on worker performance */
+                uint64 avg_produced = pg_atomic_read_u32(&shared_state->total_tuples) / 
+                                     shared_state->num_workers;
             
             if (worker->tuples_produced < avg_produced * 0.8) {
                 /* This worker is behind, focus on production */
@@ -675,7 +676,8 @@ CoordinateWorkerMaterialization(MaterialState* node)
                 }
             }
             
-            break;
+                break;
+            }
             
         case MATERIAL_STATE_DONE:
         case MATERIAL_STATE_ERROR:
@@ -724,7 +726,7 @@ UpdateMaterialStats(MaterialState* node)
     
     /* Check for memory spill conditions */
     if (worker->worker_context != NULL) {
-        size_t context_size = MemoryContextMemAllocated(worker->worker_context, true);
+        size_t context_size = MemoryContextMemConsumed(worker->worker_context);
         if (context_size > worker->worker_mem_kb * 1024L) {
             worker->memory_spills++;
             
