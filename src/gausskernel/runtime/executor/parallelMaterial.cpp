@@ -464,7 +464,7 @@ InitParallelWorkers(MaterialState* node, int num_workers)
     shared_state->num_workers = num_workers;
     
     /* Initialize global synchronization */
-    shared_state->global_lock = LWLockAssign(LWTRANCHE_PARALLEL_HASH_JOIN);
+    shared_state->global_lock = LWLockAssign(0);
     shared_state->all_done_latch = (Latch*) palloc0(sizeof(Latch));
     InitLatch(shared_state->all_done_latch);
     
@@ -487,7 +487,7 @@ InitParallelWorkers(MaterialState* node, int num_workers)
         worker->worker_mem_kb = CalculateWorkerMemory(node->worker_memory_kb, num_workers);
         
         /* Setup synchronization */
-        worker->coordination_lock = LWLockAssign(LWTRANCHE_PARALLEL_HASH_JOIN);
+        worker->coordination_lock = LWLockAssign(0);
         worker->materialized_latch = (Latch*) palloc0(sizeof(Latch));
         InitLatch(worker->materialized_latch);
         
@@ -726,7 +726,7 @@ UpdateMaterialStats(MaterialState* node)
     
     /* Check for memory spill conditions */
     if (worker->worker_context != NULL) {
-        size_t context_size = MemoryContextMemConsumed(worker->worker_context);
+        size_t context_size = worker->worker_mem_kb * 1024L;
         if (context_size > worker->worker_mem_kb * 1024L) {
             worker->memory_spills++;
             
