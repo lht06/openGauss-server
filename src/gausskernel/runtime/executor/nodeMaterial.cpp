@@ -348,7 +348,7 @@ ExecParallelMaterialProducer(MaterialState* node)
     SharedMaterialState* shared_state = node->shared_state;
     uint32 current_state = pg_atomic_read_u32(&shared_state->materialization_state);
     
-    if (current_state == MATERIAL_STATE_DONE || current_state == MATERIAL_STATE_ERROR) {
+    if (current_state == 2 || current_state == 3) {
         return NULL;
     }
     
