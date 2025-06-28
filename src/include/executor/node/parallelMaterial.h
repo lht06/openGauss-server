@@ -18,7 +18,7 @@
 #include "postgres.h"
 #include "storage/lock/lwlock.h"
 #include "storage/latch.h"
-#include "port/atomics.h"
+#include "utils/atomic.h"
 
 /* Forward declarations */
 struct MaterialState;

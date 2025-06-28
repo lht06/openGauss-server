@@ -30,7 +30,7 @@
 #include "utils/hsearch.h"
 #include "storage/lock/lwlock.h"
 #include "storage/latch.h"
-#include "port/atomics.h"
+#include "utils/atomic.h"
 #include "pgstat.h"
 
 /* Internal constants */
